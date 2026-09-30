@@ -10,10 +10,10 @@ class ValidationError(DomainError): kind=ErrorKind.VALIDATION
 class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
 class ConflictError(DomainError): kind=ErrorKind.CONFLICT
-SEVERITIES=['observation', 'minor', 'major', 'emergency']; STATES=['planned', 'inspected', 'defect_confirmed', 'repair', 'verified', 'closed']; ROLES=['inspector', 'dam_engineer', 'emergency_manager', 'viewer']
+SEVERITIES=['observation', 'minor', 'major', 'emergency']; STATES=['planned', 'inspected', 'defect_confirmed', 'repair', 'verified', 'closed']; ROLES=['inspector', 'dam_engineer', 'emergency_manager', 'viewer', 'admin']
 @dataclass(frozen=True)
 class Item:
-    id:int; title:str; description:str; severity:str; quantity:float; threshold:float; status:str; version:int; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str
+    id:int; title:str; description:str; severity:str; quantity:float; threshold:float; status:str; version:int; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str; office_id:Optional[str]; section:Optional[str]; owner:Optional[str]
 @dataclass(frozen=True)
 class Record:
     id:int; item_id:int; kind:str; detail:str; status:str; external_ref:Optional[str]; created_by:str; created_at:str
@@ -25,6 +25,11 @@ def require_text(value,field,max_length=2000):
     value=value.strip()
     if len(value)>max_length: raise ValidationError(f"{field}不能超过{max_length}个字符")
     return value
+def require_office(value):
+    if not isinstance(value,str) or not value.strip(): raise PermissionDenied("缺少管理处身份(X-Office)")
+    office=value.strip()
+    if len(office)>100: raise ValidationError("office不能超过100个字符")
+    return office
 def normalize_severity(value):
     if value not in SEVERITIES: raise ValidationError("severity不在允许范围内")
     return value

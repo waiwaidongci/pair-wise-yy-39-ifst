@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, Tuple
+from urllib.parse import urlparse
 
 from .domain import (ConflictError, DomainError, NotFoundError, PermissionDenied,
                      ValidationError)
@@ -39,8 +39,10 @@ def make_handler(service: Service, static_dir: str):
             self.end_headers()
             self.wfile.write(body)
 
-        def _identity(self) -> Tuple[str, str]:
-            return self.headers.get("X-Actor", ""), self.headers.get("X-Role", "")
+        def _identity(self) -> Tuple[str, str, str]:
+            return (self.headers.get("X-Actor", ""),
+                    self.headers.get("X-Role", ""),
+                    self.headers.get("X-Office", ""))
 
         def _body(self) -> Dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -81,23 +83,32 @@ def make_handler(service: Service, static_dir: str):
                 elif path == "/":
                     self._html(root / "index.html")
                 elif path == "/api/items":
-                    actor, role = self._identity()
+                    actor, role, office = self._identity()
                     del actor
-                    self._json(200, {"items": service.list_items(role)})
+                    self._json(200, {"items": service.list_items(role, office)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
-                    actor, role = self._identity()
+                    actor, role, office = self._identity()
                     del actor
-                    self._json(200, {"records": service.list_records(item_id, role)})
+                    self._json(200, {"records": service.list_records(
+                        item_id, role, office)})
+                elif path == "/api/admin/sections":
+                    actor, role, office = self._identity()
+                    self._json(200, {"sections": service.list_sections(
+                        actor, role, office)})
+                elif path == "/api/admin/unclaimed":
+                    actor, role, office = self._identity()
+                    self._json(200, {"items": service.list_unclaimed(
+                        actor, role, office)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
-                    actor, role = self._identity()
+                    actor, role, office = self._identity()
                     del actor
-                    self._json(200, service.get_item(item_id, role))
+                    self._json(200, service.get_item(item_id, role, office))
                 elif path == "/api/audit":
-                    actor, role = self._identity()
+                    actor, role, office = self._identity()
                     del actor
-                    self._json(200, {"events": service.audit(role)})
+                    self._json(200, {"events": service.audit(role, office)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -106,19 +117,36 @@ def make_handler(service: Service, static_dir: str):
         def do_POST(self) -> None:
             try:
                 path = urlparse(self.path).path
-                actor, role = self._identity()
+                actor, role, office = self._identity()
                 body = self._body()
                 if path == "/api/items":
-                    self._json(201, service.create_item(body, actor, role))
+                    self._json(201, service.create_item(body, actor, role, office))
+                elif path == "/api/admin/sections":
+                    self._json(201, service.register_section(
+                        body, actor, role, office))
+                elif path == "/api/admin/actors":
+                    self._json(201, service.register_actor_office(
+                        body, actor, role, office))
+                elif path == "/api/admin/backfill":
+                    self._json(200, service.backfill(body, actor, role, office))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
-                    self._json(201, service.add_record(item_id, body, actor, role))
+                    self._json(201, service.add_record(
+                        item_id, body, actor, role, office))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
-                        item_id, target, expected, actor, role))
+                        item_id, target, expected, actor, role, office))
+                elif path.startswith("/api/items/") and path.endswith("/claim"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.claim_legacy(
+                        item_id, body, actor, role, office))
+                elif path.startswith("/api/items/") and path.endswith("/owner"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.assign_owner(
+                        item_id, body, actor, role, office))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
