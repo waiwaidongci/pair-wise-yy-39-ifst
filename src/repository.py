@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ENTITY, ID_PREFIX, STATES
 
 
 class Repository:
@@ -21,6 +21,7 @@ class Repository:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+        self._migrate()
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
@@ -38,10 +39,22 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    dam_section TEXT,
+                    office TEXT,
+                    created_office TEXT,
+                    assignee TEXT,
+                    claimed_by TEXT,
+                    claimed_at TEXT
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
                     ON items(external_ref) WHERE external_ref IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_items_office ON items(office);
+                CREATE INDEX IF NOT EXISTS idx_items_created_office ON items(created_office);
+                CREATE TABLE IF NOT EXISTS section_office_map (
+                    dam_section TEXT PRIMARY KEY,
+                    office TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
@@ -67,22 +80,42 @@ class Repository:
                 );
             """)
 
+    def _migrate(self) -> None:
+        """为旧库补充归属相关列（幂等）。"""
+        with self._lock, self.conn:
+            existing = {row[1] for row in self.conn.execute("PRAGMA table_info(items)").fetchall()}
+            additions = {
+                "dam_section": "ALTER TABLE items ADD COLUMN dam_section TEXT",
+                "office": "ALTER TABLE items ADD COLUMN office TEXT",
+                "created_office": "ALTER TABLE items ADD COLUMN created_office TEXT",
+                "assignee": "ALTER TABLE items ADD COLUMN assignee TEXT",
+                "claimed_by": "ALTER TABLE items ADD COLUMN claimed_by TEXT",
+                "claimed_at": "ALTER TABLE items ADD COLUMN claimed_at TEXT",
+            }
+            for name, ddl in additions.items():
+                if name not in existing:
+                    self.conn.execute(ddl)
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS section_office_map (
+                dam_section TEXT PRIMARY KEY, office TEXT NOT NULL)""")
+
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
         return dict(row)
 
     def create_item(self, title: str, description: str, severity: str,
                     quantity: float, threshold: float, external_ref: Optional[str],
-                    actor: str) -> Dict[str, Any]:
+                    actor: str, dam_section: str, office: Optional[str],
+                    created_office: str) -> Dict[str, Any]:
         now = utc_now()
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO items(title, description, severity, quantity, threshold,
-                       status, version, external_ref, created_by, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                       status, version, external_ref, created_by, created_at, updated_at,
+                       dam_section, office, created_office)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (title, description, severity, quantity, threshold, STATES[0], 1,
-                     external_ref, actor, now, now),
+                     external_ref, actor, now, now, dam_section, office, created_office),
                 )
                 item_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -96,12 +129,24 @@ class Repository:
             raise NotFoundError("项目不存在")
         return self._item(row)
 
-    def list_items(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM items"
-        params: tuple = ()
+    def list_items(self, status: Optional[str] = None,
+                   office: Optional[str] = None,
+                   unclaimed_only: bool = False) -> List[Dict[str, Any]]:
+        """按管理处隔离列出条目。
+
+        - unclaimed_only=True：仅未认领（office IS NULL），供管理员回填/认领。
+        - office 给定：返回本处条目 + 本处创建但尚未认领的条目（原创建人所在处可见）。
+        """
+        sql = "SELECT * FROM items WHERE 1=1"
+        params: List[Any] = []
+        if unclaimed_only:
+            sql += " AND office IS NULL"
+        elif office is not None:
+            sql += " AND (office = ? OR (office IS NULL AND created_office = ?))"
+            params.extend([office, office])
         if status:
-            sql += " WHERE status=?"
-            params = (status,)
+            sql += " AND status=?"
+            params.append(status)
         sql += " ORDER BY id DESC"
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
@@ -157,31 +202,99 @@ class Repository:
             ).fetchone()
         return int(row["n"])
 
-    def append_audit(self, action: str, entity_type: str, entity_id: int,
-                     actor: str, detail: dict) -> Dict[str, Any]:
-        with self._lock, self.conn:
+    # ---------- 坝段映射表 ----------
+    def get_mapping(self, dam_section: str) -> Optional[str]:
+        with self._lock:
             row = self.conn.execute(
-                "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+                "SELECT office FROM section_office_map WHERE dam_section=?",
+                (dam_section,),
             ).fetchone()
-            previous = row["entry_hash"] if row else "GENESIS"
-            event = make_entry(action, entity_type, entity_id, actor, detail, previous)
-            cur = self.conn.execute(
-                """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
-                   previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (event["action"], event["entity_type"], event["entity_id"], event["actor"],
-                 json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
-                 event["previous_hash"], event["entry_hash"], event["created_at"]),
+        return row["office"] if row else None
+
+    def set_mapping(self, dam_section: str, office: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT INTO section_office_map(dam_section, office) VALUES(?,?)
+                   ON CONFLICT(dam_section) DO UPDATE SET office=excluded.office""",
+                (dam_section, office),
             )
-            event_id = int(cur.lastrowid)
-        event["id"] = event_id
+
+    def list_mappings(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT dam_section, office FROM section_office_map ORDER BY dam_section"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---------- 认领 / 负责人变更（与审计同事务） ----------
+    def _append_audit(self, action: str, entity_type: str, entity_id: int,
+                       actor: str, detail: Dict[str, Any]) -> Dict[str, Any]:
+        """在已有的 self._lock 与事务内追加审计事件，不单独提交。"""
+        row = self.conn.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous = row["entry_hash"] if row else "GENESIS"
+        event = make_entry(action, entity_type, entity_id, actor, detail, previous)
+        cur = self.conn.execute(
+            """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+               previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+             json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+             event["previous_hash"], event["entry_hash"], event["created_at"]),
+        )
+        event["id"] = int(cur.lastrowid)
         return event
 
-    def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def append_audit(self, action: str, entity_type: str, entity_id: int,
+                     actor: str, detail: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            return self._append_audit(action, entity_type, entity_id, actor, detail)
+
+    def claim_with_audit(self, item_id: int, office: str, actor: str,
+                         detail: Dict[str, Any]) -> bool:
+        """原子认领：仅当仍无归属(office IS NULL)时写入归属并追加审计。
+
+        返回 False 表示已被他人认领（调用方应拒绝），条目状态/版本不变。
+        """
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE items SET office=?, claimed_by=?, claimed_at=?, updated_at=?
+                   WHERE id=? AND office IS NULL""",
+                (office, actor, now, now, item_id),
+            )
+            if cur.rowcount == 0:
+                return False
+            self._append_audit("claim", ENTITY, item_id, actor, detail)
+        return True
+
+    def designate_with_audit(self, item_id: int, assignee: str, actor: str,
+                             detail: Dict[str, Any]) -> bool:
+        """原子变更负责人：更新负责人与追加审计在同一事务，不能只写一半。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE items SET assignee=?, updated_at=? WHERE id=?",
+                (assignee, now, item_id),
+            )
+            if cur.rowcount == 0:
+                return False
+            self._append_audit("designate", ENTITY, item_id, actor, detail)
+        return True
+
+    def list_audit(self, entity_id: Optional[int] = None,
+                   entity_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"
-        params: tuple = ()
+        params: List[Any] = []
         if entity_id is not None:
             sql += " WHERE entity_id=?"
-            params = (entity_id,)
+            params.append(entity_id)
+        elif entity_ids is not None:
+            if not entity_ids:
+                return []
+            placeholders = ",".join("?" for _ in entity_ids)
+            sql += f" WHERE entity_id IN ({placeholders})"
+            params.extend(entity_ids)
         sql += " ORDER BY id"
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
